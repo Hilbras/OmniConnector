@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Format
+        run: |
+          out=$(gofmt -l $(go list -m -f '{{.Dir}}'))
+          if [ -n "$out" ]; then echo "unformatted:"; echo "$out"; exit 1; fi
+      - name: Vet
+        run: for d in $(go list -m -f '{{.Dir}}'); do (cd "$d" && go vet ./...) || exit 1; done
+      - name: Test (race)
+        run: for d in $(go list -m -f '{{.Dir}}'); do (cd "$d" && go test -race -count=1 ./...) || exit 1; done
+      - name: Build kernel API
+        run: go build -C services/kernel-api -o ../../build/kernel-api ./cmd/kernel-api

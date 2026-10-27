@@ -1,0 +1,13 @@
+go 1.22
+
+use (
+	./packages/kernel-runtime
+	./packages/shared-contracts
+	./services/kernel-api
+	./integrations/test-integration
+	./integrations/ssh
+	./integrations/sftp
+	./integrations/github
+	./integrations/vercel
+	./tests/contract
+)

@@ -1,0 +1,66 @@
+# OmniConnector — Status
+
+Progress against [`PLAN.md`](PLAN.md). Update this file whenever a phase task lands.
+
+_Last updated: 2026-10-27_
+
+## Phase overview
+
+| # | Phase | Status |
+|---|---|---|
+| 0 | Product Definition & Architecture | 🟡 Partial — ADRs 001–010, integration contract spec, initial schema exist. Missing: PRD, threat model, OpenAPI spec, dev/testing standards |
+| 1 | Kernel Foundation | 🟡 Exit criterion met; PostgreSQL persistence outstanding |
+| 2 | Authentication & Connections | ⚪ Not started (credential AES-GCM store and permission engine exist as building blocks) |
+| 3 | SSH & SFTP | ⚪ Stub manifests only; `Execute` returns `not_supported` |
+| 4 | GitHub & Vercel | ⚪ Stub manifests + partial HTTP clients; `Execute` returns `not_supported` |
+| 5 | Web Dashboard | ⚪ Not started |
+| 6 | Desktop Application | ⚪ Not started |
+| 7 | Local Agent | ⚪ Not started |
+| 8 | Additional Integrations | ⚪ Not started |
+| 9 | Public API & Client SDK | ⚪ Not started |
+| 10 | Production Readiness | ⚪ Not started |
+
+## Phase 1 — Kernel Foundation
+
+**Exit criterion:** _a test integration can register, expose capabilities, receive a valid operation, return a normalized result, and report failures correctly._
+**Met** — proven by `TestPhase1ExitCriteria` (`services/kernel-api/internal/handlers/handlers_test.go`) over HTTP, and by a manual smoke run of the built binary.
+
+| Task | Status | Where |
+|---|---|---|
+| Repository and build system | ✅ | `go.work`, `Makefile` (iterates every workspace module) |
+| Configuration management | ✅ | `packages/kernel-runtime/config` — env-driven, validated |
+| Logging and request correlation | ✅ | `logger` (slog JSON); `X-Request-ID` propagated into operation records, audit metadata, and error envelopes |
+| Package registration + lifecycle | ✅ | `kernel/kernel.go` — `Initialize` on register, `Shutdown` on kernel stop, per-package runtime context |
+| Manifest validation | ✅ | `kernel/manifest.go` — version compatibility, identifiers, capability ↔ operation consistency, retry policy sanity, input schema keywords |
+| Capability discovery | ✅ | Manifest is the source of truth; `GET /v1/integrations/{id}/capabilities` |
+| Common error handling | ✅ | `contracts.Error` implements `error`; category → HTTP status mapping; raw package errors are never returned to clients |
+| Operation dispatch | ✅ | `kernel/dispatch.go` — authn → authz (`operation.execute` + capability perms) → input schema → execution target → idempotency → bounded concurrency → timeout → normalize → persist → audit |
+| Operation state model | ✅ | Timeouts/cancels/panics on non-idempotent ops → `unknown_outcome` (non-retryable) |
+| Health endpoints | ✅ | `GET /health`, `GET /ready` |
+| Initial persistence | 🟡 | `OperationStore` interface + in-memory implementation. **PostgreSQL implementation outstanding.** Audit recorder is also in-memory |
+| Unit tests and CI | ✅ | Kernel, config, API, and a connector conformance suite (`tests/contract`); CI runs gofmt, vet, `-race` tests across all modules |
+
+### Interim decisions (revisit in Phase 2)
+
+- **Dev bearer token.** Until user/app authentication exists, the API accepts one static token (`KERNEL_DEV_TOKEN`, ≥32 chars) mapped to `dev-user` with `KERNEL_DEV_PERMISSIONS`. Unset → every authenticated route returns 401 (closed by default).
+- **Synchronous execution.** `POST /v1/operations` runs to completion and returns the record (201 even if the operation itself failed). The operation is detached from the HTTP request context, so a dropped client doesn't abort a write; cancellation is explicit. Async dispatch for long operations (ADR-006) is not built yet.
+- **Local execution target** is rejected with `not_supported` until the Local Agent exists.
+- **Connections and approvals** routes return `501 not_implemented` rather than placeholder success.
+- **Credential key**: `KERNEL_CREDENTIAL_KEY` (base64, 32 bytes). Unset → ephemeral random key with a warning. The previous hardcoded key was removed.
+
+## Next up
+
+1. Phase 1 close-out: PostgreSQL `OperationStore` + audit persistence (`deployment/schema.sql`), migrations, and a docker-compose file (the Makefile references `deployment/docker-compose.yml`, which doesn't exist yet).
+2. Phase 0 gaps: threat model and an OpenAPI document for the endpoints that now exist.
+3. Phase 2: user/app authentication replacing the dev token, connection records with ownership, credential references, connection test via `ValidateConnection`.
+
+## Running locally
+
+```bash
+make test-race      # all modules, race detector
+make run-dev        # API on :8080 with the test integration and an admin dev token
+curl -H "Authorization: Bearer dev-token-change-me-0123456789abcdef" \
+     -H "Content-Type: application/json" \
+     -d '{"integration":"test-integration","operationId":"echo","input":{"message":"hi"}}' \
+     localhost:8080/v1/operations
+```
