@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/audit"
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/ids"
+	"github.com/hilbras/omniconnector/packages/kernel-runtime/logger"
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/permission"
 	"github.com/hilbras/omniconnector/packages/shared-contracts"
 )
@@ -26,6 +28,17 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 func RequestID(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDKey{}).(string)
 	return id
+}
+
+// runningOp tracks an accepted operation until it reaches a terminal state.
+// mu serializes every state change and store write for this one operation,
+// so a cancel request and the executor can never interleave writes, and no
+// store I/O happens under the kernel-wide lock.
+type runningOp struct {
+	mu       sync.Mutex
+	op       *Operation
+	cancel   context.CancelFunc
+	finished bool
 }
 
 // Submit runs the operation lifecycle: validate, authorize, resolve, execute,
@@ -86,13 +99,8 @@ func (k *Kernel) Submit(ctx context.Context, req *contracts.OperationRequest) (*
 		return nil, contracts.NewError(contracts.ErrorCategoryNotSupported, "execution_target_unavailable", fmt.Sprintf("integration %q requires a Local Agent, which is not available", req.Integration))
 	}
 
-	if req.IdempotencyKey != "" {
-		if prior, ok := k.ops.FindByIdempotencyKey(caller.UserID, caller.AppID, req.IdempotencyKey); ok {
-			if prior.Integration != req.Integration || prior.OperationID != req.OperationID || prior.ConnectionID != req.ConnectionID {
-				return nil, contracts.NewError(contracts.ErrorCategoryConflict, "idempotency_key_reused", "idempotency key was already used for a different operation")
-			}
-			return prior, nil
-		}
+	if prior, err := k.priorOperation(ctx, caller, req); prior != nil || err != nil {
+		return prior, err
 	}
 
 	timeout := time.Duration(def.TimeoutSeconds) * time.Second
@@ -123,24 +131,57 @@ func (k *Kernel) Submit(ctx context.Context, req *contracts.OperationRequest) (*
 
 	// The operation outlives the caller's request context: a dropped client
 	// connection must not silently abort a write. Cancellation is explicit,
-	// through Cancel, or via the operation timeout.
+	// through CancelOperation, or via the operation timeout.
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
+	entry := &runningOp{op: op, cancel: cancel}
 
+	// Register before persisting so a cancel that races the insert still
+	// finds the operation; deregister if the insert fails.
 	k.mu.Lock()
-	if err := k.ops.Create(op); err != nil {
+	k.running[op.ID] = entry
+	k.mu.Unlock()
+	if err := k.ops.Create(ctx, op); err != nil {
+		k.mu.Lock()
+		delete(k.running, op.ID)
 		k.mu.Unlock()
+		if errors.Is(err, ErrDuplicateIdempotencyKey) {
+			// A concurrent request with the same key won the insert
+			if prior, perr := k.priorOperation(ctx, caller, req); prior != nil || perr != nil {
+				return prior, perr
+			}
+		}
+		k.log.Error("failed to persist operation", "request_id", op.RequestID, "error", err.Error())
 		return nil, contracts.NewError(contracts.ErrorCategoryInternal, "persistence_failed", "failed to record operation")
 	}
-	k.running[op.ID] = cancel
-	k.mu.Unlock()
 
 	execReq := *req
 	execReq.ID = op.ID
 	execReq.Input = input
 	execReq.Timeout = timeout
-	k.execute(runCtx, rp, def, op, &execReq)
+	k.execute(runCtx, rp, def, entry, &execReq)
 	return op, nil
+}
+
+// priorOperation returns the caller's earlier operation for req's idempotency
+// key, nil if there is none, or a conflict if the key was used for a
+// different request.
+func (k *Kernel) priorOperation(ctx context.Context, caller *contracts.IdentityContext, req *contracts.OperationRequest) (*Operation, error) {
+	if req.IdempotencyKey == "" {
+		return nil, nil
+	}
+	prior, err := k.ops.FindByIdempotencyKey(ctx, caller.UserID, caller.AppID, req.IdempotencyKey)
+	if errors.Is(err, ErrOperationNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		k.log.Error("idempotency lookup failed", "error", err.Error())
+		return nil, contracts.NewError(contracts.ErrorCategoryInternal, "persistence_failed", "failed to check idempotency key")
+	}
+	if prior.Integration != req.Integration || prior.OperationID != req.OperationID || prior.ConnectionID != req.ConnectionID {
+		return nil, contracts.NewError(contracts.ErrorCategoryConflict, "idempotency_key_reused", "idempotency key was already used for a different operation")
+	}
+	return prior, nil
 }
 
 type execOutcome struct {
@@ -149,24 +190,27 @@ type execOutcome struct {
 	panicked any
 }
 
-// execute waits for a concurrency slot, runs the package, and finalizes op
-func (k *Kernel) execute(ctx context.Context, rp *registeredPackage, def contracts.OperationDef, op *Operation, req *contracts.OperationRequest) {
+// execute waits for a concurrency slot, runs the package, and finalizes the operation
+func (k *Kernel) execute(ctx context.Context, rp *registeredPackage, def contracts.OperationDef, entry *runningOp, req *contracts.OperationRequest) {
+	op := entry.op
 	log := k.log.With("operation_id", op.ID, "request_id", op.RequestID, "integration", op.Integration, "operation", op.OperationID)
 
 	select {
 	case k.slots <- struct{}{}:
 	case <-ctx.Done():
 		// Never started, so cancelling is safe regardless of idempotency
-		k.finalize(ctx, op, contracts.StateCancelled, contracts.NewError(contracts.ErrorCategoryInternal, "cancelled", "operation was cancelled before it started"), nil)
+		k.finalize(ctx, entry, contracts.StateCancelled, contracts.NewError(contracts.ErrorCategoryInternal, "cancelled", "operation was cancelled before it started"), nil, log)
 		return
 	}
 
 	started := time.Now().UTC()
+	entry.mu.Lock()
 	op.StartedAt = &started
-	k.mu.Lock()
-	op.State = contracts.StateRunning
-	_ = k.ops.Update(op)
-	k.mu.Unlock()
+	if op.State == contracts.StateQueued {
+		op.State = contracts.StateRunning
+	}
+	k.persist(ctx, op, log)
+	entry.mu.Unlock()
 	log.Info("operation started")
 
 	execCtx, cancel := context.WithTimeout(ctx, req.Timeout)
@@ -194,16 +238,14 @@ func (k *Kernel) execute(ctx context.Context, rp *registeredPackage, def contrac
 	}
 
 	state, nerr, result := k.classify(execCtx, def, out, log)
-	k.finalize(ctx, op, state, nerr, result)
+	k.finalize(ctx, entry, state, nerr, result, log)
 	log.Info("operation finished", "state", op.State, "duration_ms", time.Since(started).Milliseconds())
 }
 
 // classify maps a package outcome onto the operation state model. When the
 // kernel cannot know whether a non-idempotent operation took effect, the state
 // is UnknownOutcome so nobody retries it blindly.
-func (k *Kernel) classify(execCtx context.Context, def contracts.OperationDef, out execOutcome, log interface {
-	Error(string, ...interface{})
-}) (contracts.OperationState, *contracts.Error, *contracts.OperationResult) {
+func (k *Kernel) classify(execCtx context.Context, def contracts.OperationDef, out execOutcome, log *logger.Logger) (contracts.OperationState, *contracts.Error, *contracts.OperationResult) {
 	unknown := func(cause string) *contracts.Error {
 		e := contracts.NewError(contracts.ErrorCategoryInternal, "outcome_unknown",
 			cause+"; the operation may or may not have taken effect and must be reconciled before retrying")
@@ -264,11 +306,14 @@ func (k *Kernel) classify(execCtx context.Context, def contracts.OperationDef, o
 	return contracts.StateSucceeded, nil, out.result
 }
 
-// finalize persists the terminal state and records the audit event
-func (k *Kernel) finalize(ctx context.Context, op *Operation, state contracts.OperationState, nerr *contracts.Error, result *contracts.OperationResult) {
+// finalize persists the terminal state, deregisters the operation, and
+// records the audit event
+func (k *Kernel) finalize(ctx context.Context, entry *runningOp, state contracts.OperationState, nerr *contracts.Error, result *contracts.OperationResult, log *logger.Logger) {
+	op := entry.op
 	finished := time.Now().UTC()
-	k.mu.Lock()
-	delete(k.running, op.ID)
+
+	entry.mu.Lock()
+	entry.finished = true
 	op.State = state
 	op.Error = nerr
 	op.FinishedAt = &finished
@@ -276,7 +321,11 @@ func (k *Kernel) finalize(ctx context.Context, op *Operation, state contracts.Op
 		op.Result = result.Data
 		op.ResultMetadata = result.Metadata
 	}
-	_ = k.ops.Update(op)
+	k.persist(ctx, op, log)
+	entry.mu.Unlock()
+
+	k.mu.Lock()
+	delete(k.running, op.ID)
 	k.mu.Unlock()
 
 	meta := map[string]any{
@@ -292,33 +341,50 @@ func (k *Kernel) finalize(ctx context.Context, op *Operation, state contracts.Op
 		"operation.execute", op.Integration+"/"+op.OperationID, string(state), meta)
 }
 
+// persist writes op to the store. A failed write is logged, not fatal: the
+// in-flight execution is already committed to finishing.
+func (k *Kernel) persist(ctx context.Context, op *Operation, log *logger.Logger) {
+	if err := k.ops.Update(ctx, op); err != nil {
+		log.Error("failed to persist operation state", "state", op.State, "error", err.Error())
+	}
+}
+
 // GetOperation returns an operation visible to the caller. Operations owned
 // by someone else are reported as not found rather than forbidden so IDs
 // cannot be probed.
-func (k *Kernel) GetOperation(caller *contracts.IdentityContext, id string) (*Operation, error) {
-	op, ok := k.ops.Get(id)
-	if !ok || !k.canSee(caller, op) {
+func (k *Kernel) GetOperation(ctx context.Context, caller *contracts.IdentityContext, id string) (*Operation, error) {
+	op, err := k.ops.Get(ctx, id)
+	if errors.Is(err, ErrOperationNotFound) || (err == nil && !k.canSee(caller, op)) {
 		return nil, contracts.NewError(contracts.ErrorCategoryNotFound, "operation_not_found", "operation not found")
+	}
+	if err != nil {
+		k.log.Error("operation lookup failed", "operation_id", id, "error", err.Error())
+		return nil, contracts.NewError(contracts.ErrorCategoryInternal, "persistence_failed", "failed to load operation")
 	}
 	return op, nil
 }
 
 // ListOperations returns the caller's operations, newest first. Admins see all.
-func (k *Kernel) ListOperations(caller *contracts.IdentityContext, limit int) []*Operation {
+func (k *Kernel) ListOperations(ctx context.Context, caller *contracts.IdentityContext, limit int) ([]*Operation, error) {
 	if caller == nil {
-		return nil
+		return nil, contracts.NewError(contracts.ErrorCategoryAuthFailed, "unauthenticated", "caller is required")
 	}
 	f := OperationFilter{Limit: limit}
 	if !k.permEngine.HasPermission(granteeOf(caller), permission.PermissionAdmin) {
 		f.CallerUserID, f.CallerAppID = caller.UserID, caller.AppID
 	}
-	return k.ops.List(f)
+	ops, err := k.ops.List(ctx, f)
+	if err != nil {
+		k.log.Error("operation list failed", "error", err.Error())
+		return nil, contracts.NewError(contracts.ErrorCategoryInternal, "persistence_failed", "failed to list operations")
+	}
+	return ops, nil
 }
 
 // CancelOperation requests cancellation of a queued or running operation.
 // The final state is set by the executor once the package stops.
 func (k *Kernel) CancelOperation(ctx context.Context, caller *contracts.IdentityContext, id string) (*Operation, error) {
-	op, err := k.GetOperation(caller, id)
+	op, err := k.GetOperation(ctx, caller, id)
 	if err != nil {
 		return nil, err
 	}
@@ -326,19 +392,27 @@ func (k *Kernel) CancelOperation(ctx context.Context, caller *contracts.Identity
 		return nil, contracts.NewError(contracts.ErrorCategoryPermission, "permission_denied", "missing required permission: operation.cancel")
 	}
 
-	k.mu.Lock()
-	cancel, running := k.running[id]
+	k.mu.RLock()
+	entry, running := k.running[id]
+	k.mu.RUnlock()
 	if !running {
-		k.mu.Unlock()
 		return nil, contracts.NewError(contracts.ErrorCategoryConflict, "operation_finished", fmt.Sprintf("operation is already %s", op.State))
 	}
-	op.State = contracts.StateCancelRequested
-	_ = k.ops.Update(op)
-	cancel()
-	k.mu.Unlock()
+
+	entry.mu.Lock()
+	if entry.finished {
+		state := entry.op.State
+		entry.mu.Unlock()
+		return nil, contracts.NewError(contracts.ErrorCategoryConflict, "operation_finished", fmt.Sprintf("operation is already %s", state))
+	}
+	entry.op.State = contracts.StateCancelRequested
+	k.persist(ctx, entry.op, k.log.With("operation_id", id))
+	snapshot := *entry.op
+	entry.cancel()
+	entry.mu.Unlock()
 
 	k.recordAudit(ctx, caller, "operation.cancel", op.Integration+"/"+op.OperationID, "requested", map[string]any{"operationId": id})
-	return op, nil
+	return &snapshot, nil
 }
 
 func (k *Kernel) canSee(caller *contracts.IdentityContext, op *Operation) bool {
@@ -363,7 +437,7 @@ func (k *Kernel) recordAudit(ctx context.Context, caller *contracts.IdentityCont
 	if rid := RequestID(ctx); rid != "" {
 		meta["requestId"] = rid
 	}
-	k.auditRec.Record(ctx, audit.Event{
+	err := k.auditRec.Record(ctx, audit.Event{
 		Actor:      actor,
 		ActorType:  actorType,
 		Action:     action,
@@ -372,6 +446,11 @@ func (k *Kernel) recordAudit(ctx context.Context, caller *contracts.IdentityCont
 		Outcome:    outcome,
 		Metadata:   meta,
 	})
+	if err != nil {
+		// Audit loss is a security-relevant failure: log loudly with enough
+		// context to reconstruct the event.
+		k.log.Error("failed to record audit event", "action", action, "actor", actor, "target", target, "outcome", outcome, "error", err.Error())
+	}
 }
 
 func granteeOf(c *contracts.IdentityContext) *permission.Grantee {

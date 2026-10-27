@@ -1,0 +1,23 @@
+# Build context: repository root
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+ENV CGO_ENABLED=0 GOFLAGS=-trimpath
+
+# Module files first so dependency downloads are cached across source edits
+COPY go.work go.work.sum ./
+COPY packages/shared-contracts/go.mod packages/shared-contracts/
+COPY packages/kernel-runtime/go.mod packages/kernel-runtime/go.sum packages/kernel-runtime/
+COPY services/kernel-api/go.mod services/kernel-api/go.sum services/kernel-api/
+COPY integrations/ integrations/
+COPY tests/contract/go.mod tests/contract/
+RUN go mod download -C packages/kernel-runtime
+
+COPY packages/ packages/
+COPY services/ services/
+RUN go build -C services/kernel-api -ldflags="-s -w" -o /out/kernel-api ./cmd/kernel-api
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/kernel-api /kernel-api
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/kernel-api"]

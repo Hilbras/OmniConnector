@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hilbras/omniconnector/packages/kernel-runtime/audit"
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/config"
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/logger"
 	"github.com/hilbras/omniconnector/packages/shared-contracts"
@@ -250,13 +251,13 @@ func TestSubmitSucceeds(t *testing.T) {
 		t.Error("expected start and finish timestamps")
 	}
 
-	stored, err := k.GetOperation(reader, op.ID)
+	stored, err := k.GetOperation(context.Background(), reader, op.ID)
 	if err != nil || stored.State != contracts.StateSucceeded {
 		t.Fatalf("stored operation not retrievable: %v %v", stored, err)
 	}
 
-	events := k.AuditRecorder().List()
-	last := events[len(events)-1]
+	events, _ := k.AuditRecorder().List(context.Background(), audit.Filter{})
+	last := events[0]
 	if last.Action != "operation.execute" || last.Outcome != "succeeded" || last.Actor != "u-reader" {
 		t.Errorf("unexpected audit event: %+v", last)
 	}
@@ -294,7 +295,8 @@ func TestSubmitRejections(t *testing.T) {
 		t.Errorf("rejected requests must never reach the package, got %d calls", p.calls.Load())
 	}
 	denied := 0
-	for _, e := range k.AuditRecorder().List() {
+	events, _ := k.AuditRecorder().List(context.Background(), audit.Filter{})
+	for _, e := range events {
 		if e.Action == "operation.authorize" && e.Outcome == "denied" {
 			denied++
 		}
@@ -526,15 +528,15 @@ func TestOperationVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = k.GetOperation(reader, op.ID)
+	_, err = k.GetOperation(context.Background(), reader, op.ID)
 	wantCategory(t, err, contracts.ErrorCategoryNotFound)
-	if _, err := k.GetOperation(admin, op.ID); err != nil {
+	if _, err := k.GetOperation(context.Background(), admin, op.ID); err != nil {
 		t.Errorf("admin should see every operation: %v", err)
 	}
-	if n := len(k.ListOperations(reader, 0)); n != 0 {
+	if n := len(mustList(t, k, reader)); n != 0 {
 		t.Errorf("reader should see no operations, got %d", n)
 	}
-	if n := len(k.ListOperations(writer, 0)); n != 1 {
+	if n := len(mustList(t, k, writer)); n != 1 {
 		t.Errorf("writer should see 1 operation, got %d", n)
 	}
 }
@@ -588,5 +590,57 @@ func TestHealth(t *testing.T) {
 	h := k.Health()
 	if h["status"] != "healthy" || h["version"] != Version {
 		t.Errorf("unexpected health: %v", h)
+	}
+}
+
+func mustList(t *testing.T, k *Kernel, caller *contracts.IdentityContext) []*Operation {
+	t.Helper()
+	ops, err := k.ListOperations(context.Background(), caller, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ops
+}
+
+// TestConcurrentIdempotentRetries fires the same keyed request concurrently:
+// exactly one execution may happen and every caller sees the same operation.
+func TestConcurrentIdempotentRetries(t *testing.T) {
+	k := newTestKernel(t)
+	release := make(chan struct{})
+	p := &fakePackage{manifest: validManifest("test"), execute: func(ctx context.Context, op *contracts.OperationRequest) (*contracts.OperationResult, error) {
+		<-release
+		return &contracts.OperationResult{}, nil
+	}}
+	register(t, k, p)
+
+	const n = 8
+	ids := make(chan string, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			op, err := k.Submit(context.Background(), &contracts.OperationRequest{Integration: "test", OperationID: "item.create", Caller: writer, IdempotencyKey: "race"})
+			if err != nil {
+				ids <- "error: " + err.Error()
+				return
+			}
+			ids <- op.ID
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	first := <-ids
+	for i := 1; i < n; i++ {
+		if got := <-ids; got != first {
+			t.Fatalf("concurrent retries diverged: %s vs %s", first, got)
+		}
+	}
+	if c := p.calls.Load(); c != 1 {
+		t.Fatalf("expected exactly one execution, got %d", c)
+	}
+}
+
+func TestReadyWithMemoryStores(t *testing.T) {
+	if err := newTestKernel(t).Ready(context.Background()); err != nil {
+		t.Fatalf("memory-backed kernel should be ready: %v", err)
 	}
 }

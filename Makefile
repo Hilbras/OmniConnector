@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-race lint format format-check run-dev clean docker-up docker-down
+.PHONY: build test test-all test-race test-pg lint format format-check run-dev clean docker-up docker-down
 
 export PATH := /home/gin/go/bin:$(PATH)
 export GOPATH := /home/gin/go/path
@@ -22,6 +22,14 @@ test-all:
 test-race:
 	@set -e; for d in $(GO_MODULES); do echo "== $$d"; (cd $$d && go test -race ./... -count=1); done
 
+## PostgreSQL store tests against a throwaway container (removed afterwards)
+test-pg:
+	@docker run -d --rm --name omniconnector-test-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=omni_test \
+		-p 127.0.0.1:55439:5432 postgres:16-alpine >/dev/null
+	@until docker exec omniconnector-test-pg pg_isready -U postgres -d omni_test >/dev/null 2>&1; do sleep 1; done; sleep 1
+	@cd packages/kernel-runtime && KERNEL_TEST_DATABASE_DSN="postgres://postgres:test@127.0.0.1:55439/omni_test?sslmode=disable" \
+		go test -race -count=1 ./pgstore/... ; status=$$?; docker rm -f omniconnector-test-pg >/dev/null; exit $$status
+
 ## Vet every module
 lint:
 	@set -e; for d in $(GO_MODULES); do (cd $$d && go vet ./...); done
@@ -43,7 +51,7 @@ run-dev: build
 
 ## Docker
 docker-up:
-	docker compose -f deployment/docker-compose.yml up -d
+	docker compose -f deployment/docker-compose.yml up -d --build --wait
 
 docker-down:
 	docker compose -f deployment/docker-compose.yml down

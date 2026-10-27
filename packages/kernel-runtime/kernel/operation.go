@@ -1,6 +1,8 @@
 package kernel
 
 import (
+	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -51,17 +53,26 @@ type OperationFilter struct {
 	Limit        int
 }
 
-// OperationStore persists operation records. The in-memory implementation
-// backs Phase 1; a PostgreSQL implementation replaces it without changing
-// the dispatcher.
+var (
+	// ErrOperationNotFound is returned when no operation matches
+	ErrOperationNotFound = errors.New("operation not found")
+	// ErrDuplicateIdempotencyKey is returned by Create when the caller
+	// already has an operation with the same idempotency key
+	ErrDuplicateIdempotencyKey = errors.New("duplicate idempotency key")
+)
+
+// OperationStore persists operation records. Implementations: the in-memory
+// store below and the PostgreSQL store in package pgstore.
 type OperationStore interface {
-	Create(op *Operation) error
-	Update(op *Operation) error
-	Get(id string) (*Operation, bool)
-	// FindByIdempotencyKey returns the operation a caller previously created
-	// with the same key, so a retried request returns the original outcome.
-	FindByIdempotencyKey(callerUserID, callerAppID, key string) (*Operation, bool)
-	List(filter OperationFilter) []*Operation
+	// Create inserts a new operation. It must fail with
+	// ErrDuplicateIdempotencyKey if the caller already used the key, so that
+	// concurrent retries cannot both execute.
+	Create(ctx context.Context, op *Operation) error
+	Update(ctx context.Context, op *Operation) error
+	Get(ctx context.Context, id string) (*Operation, error)
+	FindByIdempotencyKey(ctx context.Context, callerUserID, callerAppID, key string) (*Operation, error)
+	// List returns matching operations, newest first
+	List(ctx context.Context, filter OperationFilter) ([]*Operation, error)
 }
 
 // MemoryOperationStore is an in-process OperationStore. Records are copied in
@@ -82,51 +93,58 @@ func idempotencyIndexKey(userID, appID, key string) string {
 }
 
 // Create stores a new operation
-func (s *MemoryOperationStore) Create(op *Operation) error {
+func (s *MemoryOperationStore) Create(ctx context.Context, op *Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if op.IdempotencyKey != "" {
+		k := idempotencyIndexKey(op.CallerUserID, op.CallerAppID, op.IdempotencyKey)
+		if _, exists := s.idemp[k]; exists {
+			return ErrDuplicateIdempotencyKey
+		}
+		s.idemp[k] = op.ID
+	}
 	cp := *op
 	s.ops[op.ID] = &cp
-	if op.IdempotencyKey != "" {
-		s.idemp[idempotencyIndexKey(op.CallerUserID, op.CallerAppID, op.IdempotencyKey)] = op.ID
-	}
 	return nil
 }
 
 // Update replaces a stored operation
-func (s *MemoryOperationStore) Update(op *Operation) error {
+func (s *MemoryOperationStore) Update(ctx context.Context, op *Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.ops[op.ID]; !ok {
+		return ErrOperationNotFound
+	}
 	cp := *op
 	s.ops[op.ID] = &cp
 	return nil
 }
 
 // Get returns a copy of the operation with the given ID
-func (s *MemoryOperationStore) Get(id string) (*Operation, bool) {
+func (s *MemoryOperationStore) Get(ctx context.Context, id string) (*Operation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	op, ok := s.ops[id]
 	if !ok {
-		return nil, false
+		return nil, ErrOperationNotFound
 	}
 	cp := *op
-	return &cp, true
+	return &cp, nil
 }
 
 // FindByIdempotencyKey looks up a prior operation by caller and key
-func (s *MemoryOperationStore) FindByIdempotencyKey(userID, appID, key string) (*Operation, bool) {
+func (s *MemoryOperationStore) FindByIdempotencyKey(ctx context.Context, userID, appID, key string) (*Operation, error) {
 	s.mu.RLock()
 	id, ok := s.idemp[idempotencyIndexKey(userID, appID, key)]
 	s.mu.RUnlock()
 	if !ok {
-		return nil, false
+		return nil, ErrOperationNotFound
 	}
-	return s.Get(id)
+	return s.Get(ctx, id)
 }
 
 // List returns matching operations, newest first
-func (s *MemoryOperationStore) List(f OperationFilter) []*Operation {
+func (s *MemoryOperationStore) List(ctx context.Context, f OperationFilter) ([]*Operation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Operation, 0)
@@ -144,5 +162,5 @@ func (s *MemoryOperationStore) List(f OperationFilter) []*Operation {
 	if f.Limit > 0 && len(out) > f.Limit {
 		out = out[:f.Limit]
 	}
-	return out
+	return out, nil
 }

@@ -56,11 +56,24 @@ type Kernel struct {
 
 	mu      sync.RWMutex
 	pkgs    map[string]*registeredPackage
-	running map[string]context.CancelFunc
+	running map[string]*runningOp
+}
+
+// Option configures a Kernel
+type Option func(*Kernel)
+
+// WithOperationStore replaces the default in-memory operation store
+func WithOperationStore(s OperationStore) Option {
+	return func(k *Kernel) { k.ops = s }
+}
+
+// WithAuditStore replaces the default in-memory audit store
+func WithAuditStore(s audit.Store) Option {
+	return func(k *Kernel) { k.auditRec = audit.NewWithStore(s) }
 }
 
 // New creates a new kernel
-func New(cfg *config.Config, log *logger.Logger) (*Kernel, error) {
+func New(cfg *config.Config, log *logger.Logger, opts ...Option) (*Kernel, error) {
 	encKey := cfg.CredentialKeyBytes()
 	if encKey == nil {
 		encKey = make([]byte, 32)
@@ -79,11 +92,11 @@ func New(cfg *config.Config, log *logger.Logger) (*Kernel, error) {
 		maxConcurrent = 1
 	}
 
-	return &Kernel{
+	k := &Kernel{
 		cfg:        cfg,
 		log:        log,
 		pkgs:       make(map[string]*registeredPackage),
-		running:    make(map[string]context.CancelFunc),
+		running:    make(map[string]*runningOp),
 		connMgr:    connection.New(),
 		credStore:  credStore,
 		tokenMgr:   auth.New(),
@@ -92,7 +105,11 @@ func New(cfg *config.Config, log *logger.Logger) (*Kernel, error) {
 		ops:        NewMemoryOperationStore(),
 		slots:      make(chan struct{}, maxConcurrent),
 		startedAt:  time.Now(),
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(k)
+	}
+	return k, nil
 }
 
 // Start starts the kernel
@@ -106,8 +123,8 @@ func (k *Kernel) Shutdown(ctx context.Context) error {
 	k.log.Info("kernel shutting down")
 
 	k.mu.Lock()
-	for _, cancel := range k.running {
-		cancel()
+	for _, entry := range k.running {
+		entry.cancel()
 	}
 	pkgs := k.pkgs
 	k.pkgs = make(map[string]*registeredPackage)
@@ -242,6 +259,21 @@ func (k *Kernel) PermissionEngine() *permission.Engine {
 func (k *Kernel) AuditRecorder() *audit.Recorder {
 	return k.auditRec
 }
+
+// Ready reports whether the kernel can serve traffic: every store that can
+// be pinged must answer
+func (k *Kernel) Ready(ctx context.Context) error {
+	for _, s := range []any{k.ops, k.auditStore()} {
+		if p, ok := s.(interface{ Ping(context.Context) error }); ok {
+			if err := p.Ping(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (k *Kernel) auditStore() any { return k.auditRec.Store() }
 
 // Health returns the kernel health status
 func (k *Kernel) Health() map[string]interface{} {

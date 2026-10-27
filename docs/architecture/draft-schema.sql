@@ -1,4 +1,14 @@
--- OmniConnector Database Schema
+-- DRAFT — design reference only, never applied.
+--
+-- The live schema is defined by the versioned migrations in
+-- packages/kernel-runtime/pgstore/migrations, applied by pgstore.Migrate.
+-- Tables below that are not yet migrated (users, applications, devices,
+-- integrations, connections, credentials, approvals, agent_sessions) should
+-- be revisited when their phase lands. Known issues with this draft:
+--   * operations.input stores raw input, which may contain secrets
+--   * operations.connection_id is NOT NULL, but operations may run without one
+--   * caller/actor/target IDs are UUID, but kernel identifiers are prefixed text
+--
 -- Target: PostgreSQL 14+
 
 -- Users

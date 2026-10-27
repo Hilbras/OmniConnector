@@ -9,6 +9,22 @@ on:
 jobs:
   go:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: omni_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d omni_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      # PostgreSQL store tests skip without this; in CI they must run
+      KERNEL_TEST_DATABASE_DSN: postgres://postgres:test@localhost:5432/omni_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -24,3 +40,5 @@ jobs:
         run: for d in $(go list -m -f '{{.Dir}}'); do (cd "$d" && go test -race -count=1 ./...) || exit 1; done
       - name: Build kernel API
         run: go build -C services/kernel-api -o ../../build/kernel-api ./cmd/kernel-api
+      - name: Build container image
+        run: docker build -f deployment/Dockerfile.kernel-api .

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -76,8 +77,15 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.kernel.Health())
 }
 
-// Ready returns readiness status
+// Ready reports whether the kernel and its stores can serve traffic
 func (h *Handler) Ready(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := h.kernel.Ready(ctx); err != nil {
+		h.log.Warn("readiness check failed", "error", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, contracts.NewError(contracts.ErrorCategoryInternal, "not_ready", "a backing store is unavailable"))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
@@ -182,12 +190,17 @@ func (h *Handler) ListOperations(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"operations": h.kernel.ListOperations(identityFrom(r.Context()), limit)})
+	ops, kerr := h.kernel.ListOperations(r.Context(), identityFrom(r.Context()), limit)
+	if kerr != nil {
+		writeKernelError(w, r, kerr)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"operations": ops})
 }
 
 // GetOperation returns one operation
 func (h *Handler) GetOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := h.kernel.GetOperation(identityFrom(r.Context()), r.PathValue("operationId"))
+	op, err := h.kernel.GetOperation(r.Context(), identityFrom(r.Context()), r.PathValue("operationId"))
 	if err != nil {
 		writeKernelError(w, r, err)
 		return
@@ -221,22 +234,20 @@ func (h *Handler) ListAuditEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var events []audit.Event
-	if engine.HasPermission(grantee, permission.PermissionAdmin) {
-		events = h.kernel.AuditRecorder().List()
-	} else {
-		actor := caller.UserID
-		if actor == "" {
-			actor = caller.AppID
+	filter := audit.Filter{Limit: limit}
+	if !engine.HasPermission(grantee, permission.PermissionAdmin) {
+		filter.Actor = caller.UserID
+		if filter.Actor == "" {
+			filter.Actor = caller.AppID
 		}
-		events = h.kernel.AuditRecorder().ListByActor(actor)
 	}
-	// Newest first
-	out := make([]audit.Event, 0, limit)
-	for i := len(events) - 1; i >= 0 && len(out) < limit; i-- {
-		out = append(out, events[i])
+	events, aerr := h.kernel.AuditRecorder().List(r.Context(), filter)
+	if aerr != nil {
+		h.log.Error("audit list failed", "error", aerr.Error())
+		writeError(w, r, http.StatusInternalServerError, contracts.NewError(contracts.ErrorCategoryInternal, "persistence_failed", "failed to list audit events"))
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": out})
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
 func notImplemented(w http.ResponseWriter, r *http.Request) {

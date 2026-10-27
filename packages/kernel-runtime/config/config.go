@@ -37,7 +37,11 @@ type LogConfig struct {
 
 // DatabaseConfig holds database configuration
 type DatabaseConfig struct {
+	// DSN selects PostgreSQL persistence. Empty means in-memory stores,
+	// which lose all operation history and audit events on restart.
 	DSN string
+	// AutoMigrate applies pending schema migrations at startup
+	AutoMigrate bool
 }
 
 // ExecutionConfig holds execution configuration
@@ -77,7 +81,8 @@ func Load() (*Config, error) {
 			Level: getEnv("KERNEL_LOG_LEVEL", "info"),
 		},
 		Database: DatabaseConfig{
-			DSN: getEnv("KERNEL_DATABASE_DSN", "postgres://omniconnector:omniconnector@localhost:5432/omniconnector?sslmode=disable"),
+			DSN:         getEnv("KERNEL_DATABASE_DSN", ""),
+			AutoMigrate: getEnv("KERNEL_DATABASE_AUTO_MIGRATE", "true") == "true",
 		},
 		Execution: ExecutionConfig{
 			MaxConcurrent:  getEnvInt("KERNEL_EXECUTION_MAX_CONCURRENT", 10),

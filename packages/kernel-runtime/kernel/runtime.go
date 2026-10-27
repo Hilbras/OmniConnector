@@ -55,7 +55,7 @@ func (rc *runtimeContext) EmitAuditEvent(ctx context.Context, ev contracts.Audit
 	if rid := RequestID(ctx); rid != "" {
 		meta["requestId"] = rid
 	}
-	rc.k.auditRec.Record(ctx, audit.Event{
+	return rc.k.auditRec.Record(ctx, audit.Event{
 		Actor:      rc.name,
 		ActorType:  "integration",
 		Action:     ev.Action,
@@ -65,7 +65,6 @@ func (rc *runtimeContext) EmitAuditEvent(ctx context.Context, ev contracts.Audit
 		Metadata:   meta,
 		Timestamp:  ev.Timestamp,
 	})
-	return nil
 }
 
 // ProgressChan returns the package's progress channel. Packages must not

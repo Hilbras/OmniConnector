@@ -14,6 +14,7 @@ import (
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/config"
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/kernel"
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/logger"
+	"github.com/hilbras/omniconnector/packages/kernel-runtime/pgstore"
 	"github.com/hilbras/omniconnector/services/kernel-api/internal/authn"
 	"github.com/hilbras/omniconnector/services/kernel-api/internal/handlers"
 )
@@ -32,7 +33,26 @@ func run() error {
 	}
 	log := logger.New(cfg.Log.Level)
 
-	k, err := kernel.New(cfg, log)
+	var opts []kernel.Option
+	if cfg.Database.DSN == "" {
+		log.Warn("KERNEL_DATABASE_DSN is not set; using in-memory stores, operation history and audit events will not survive restart")
+	} else {
+		pool, err := pgstore.Open(context.Background(), cfg.Database.DSN)
+		if err != nil {
+			return fmt.Errorf("open database: %w", err)
+		}
+		defer pool.Close()
+		if cfg.Database.AutoMigrate {
+			applied, err := pgstore.Migrate(context.Background(), pool)
+			if err != nil {
+				return fmt.Errorf("migrate database: %w", err)
+			}
+			log.Info("database migrated", "applied", applied)
+		}
+		opts = append(opts, kernel.WithOperationStore(pgstore.NewOperationStore(pool)), kernel.WithAuditStore(pgstore.NewAuditStore(pool)))
+	}
+
+	k, err := kernel.New(cfg, log, opts...)
 	if err != nil {
 		return fmt.Errorf("create kernel: %w", err)
 	}

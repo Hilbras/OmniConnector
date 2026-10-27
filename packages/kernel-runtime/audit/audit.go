@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"github.com/hilbras/omniconnector/packages/kernel-runtime/ids"
-	"github.com/hilbras/omniconnector/packages/shared-contracts"
 )
 
-// Event represents an audit event
+// Event represents an audit event. It must never carry secrets: no
+// passwords, tokens, keys, or raw operation input.
 type Event struct {
 	ID         string         `json:"id"`
 	Actor      string         `json:"actor"`
@@ -22,68 +22,86 @@ type Event struct {
 	Timestamp  time.Time      `json:"timestamp"`
 }
 
-// Recorder records audit events
+// Filter narrows a List call. Zero values mean "no constraint".
+type Filter struct {
+	Actor string
+	Limit int
+}
+
+// Store persists audit events. Events are append-only.
+type Store interface {
+	Append(ctx context.Context, e Event) error
+	// List returns matching events, newest first
+	List(ctx context.Context, f Filter) ([]Event, error)
+}
+
+// Recorder stamps events with an ID and timestamp and appends them to a Store
 type Recorder struct {
-	mu     sync.RWMutex
-	events []Event
+	store Store
 }
 
-// New creates a new audit recorder
+// New creates a recorder backed by an in-memory store
 func New() *Recorder {
-	return &Recorder{events: make([]Event, 0)}
+	return NewWithStore(NewMemoryStore())
 }
 
-// Record records an audit event
-func (r *Recorder) Record(ctx context.Context, event Event) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// NewWithStore creates a recorder backed by the given store
+func NewWithStore(s Store) *Recorder {
+	return &Recorder{store: s}
+}
+
+// Record appends an audit event
+func (r *Recorder) Record(ctx context.Context, event Event) error {
 	if event.ID == "" {
 		event.ID = ids.WithPrefix("aud")
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
 	}
-	r.events = append(r.events, event)
+	return r.store.Append(ctx, event)
 }
 
-// RecordFromContract records an audit event from a shared-contracts AuditEvent
-func (r *Recorder) RecordFromContract(ctx context.Context, ae contracts.AuditEvent) {
-	r.Record(ctx, Event{
-		Actor:      ae.Actor,
-		Action:     ae.Action,
-		TargetType: "resource",
-		TargetID:   ae.Target,
-		Outcome:    ae.Outcome,
-		Metadata:   ae.Metadata,
-		Timestamp:  ae.Timestamp,
-	})
+// Store returns the underlying store
+func (r *Recorder) Store() Store { return r.store }
+
+// List returns matching events, newest first
+func (r *Recorder) List(ctx context.Context, f Filter) ([]Event, error) {
+	return r.store.List(ctx, f)
 }
 
-// List returns all recorded events
-func (r *Recorder) List() []Event {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	result := make([]Event, len(r.events))
-	copy(result, r.events)
-	return result
+// MemoryStore is an in-process Store for tests and local development
+type MemoryStore struct {
+	mu     sync.RWMutex
+	events []Event
 }
 
-// ListByActor returns events for a specific actor
-func (r *Recorder) ListByActor(actor string) []Event {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	var result []Event
-	for _, e := range r.events {
-		if e.Actor == actor {
-			result = append(result, e)
+// NewMemoryStore creates an empty in-memory store
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{}
+}
+
+// Append stores an event
+func (m *MemoryStore) Append(ctx context.Context, e Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, e)
+	return nil
+}
+
+// List returns matching events, newest first
+func (m *MemoryStore) List(ctx context.Context, f Filter) ([]Event, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Event, 0)
+	for i := len(m.events) - 1; i >= 0; i-- {
+		e := m.events[i]
+		if f.Actor != "" && e.Actor != f.Actor {
+			continue
+		}
+		out = append(out, e)
+		if f.Limit > 0 && len(out) == f.Limit {
+			break
 		}
 	}
-	return result
-}
-
-// Count returns the number of recorded events
-func (r *Recorder) Count() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.events)
+	return out, nil
 }

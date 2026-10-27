@@ -1,0 +1,39 @@
+# Local development stack: PostgreSQL + Kernel API with the test integration.
+# The dev token and database password are for local use only.
+name: omniconnector
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: omniconnector
+      POSTGRES_PASSWORD: omniconnector
+      POSTGRES_DB: omniconnector
+    # No host port: the API reaches it on the compose network. For a shell:
+    #   docker compose -f deployment/docker-compose.yml exec postgres psql -U omniconnector
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omniconnector -d omniconnector"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  kernel-api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.kernel-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KERNEL_HTTP_ADDR: ":8080"
+      KERNEL_DATABASE_DSN: postgres://omniconnector:omniconnector@postgres:5432/omniconnector?sslmode=disable
+      KERNEL_DEV_TOKEN: dev-token-change-me-0123456789abcdef
+      KERNEL_DEV_PERMISSIONS: admin
+      KERNEL_ENABLE_TEST_INTEGRATION: "true"
+    ports:
+      - "127.0.0.1:${OMNI_API_PORT:-8080}:8080"
+
+volumes:
+  pgdata:
