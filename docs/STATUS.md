@@ -2,7 +2,7 @@
 
 Progress against [`PLAN.md`](PLAN.md). Update this file whenever a phase task lands.
 
-_Last updated: 2026-10-27 (Phase 1 complete)_
+_Last updated: 2026-10-27 (Phase 1 complete; v0.1.0 released)_
 
 ## Phase overview
 
@@ -17,7 +17,7 @@ _Last updated: 2026-10-27 (Phase 1 complete)_
 | 6 | Desktop Application | ⚪ Not started |
 | 7 | Local Agent | ⚪ Not started |
 | 8 | Additional Integrations | ⚪ Not started |
-| 9 | Public API & Client SDK | ⚪ Not started |
+| 9 | Public API & Client SDK | 🟡 Early slice — `@hilbras/omniconnector` 0.1.0 TypeScript client for the current endpoints (`packages/client-sdk`). Scoped app tokens, app registration, and the finalized contract are still to come |
 | 10 | Production Readiness | ⚪ Not started |
 
 ## Phase 1 — Kernel Foundation
@@ -58,6 +58,14 @@ _Last updated: 2026-10-27 (Phase 1 complete)_
 2. Startup reconciliation: mark operations left `queued`/`running` by a crash as `unknown_outcome` (or `cancelled` if never started).
 3. Phase 2: user/app authentication replacing the dev token, connection records with ownership, credential references, connection test via `ValidateConnection`.
 
+## Releases
+
+| Version | Date | Contents |
+|---|---|---|
+| v0.1.0 | 2026-10-27 | Phase 1 kernel foundation + `@hilbras/omniconnector` 0.1.0 client. GitHub: `Hilbras/OmniConnector`, npm: `@hilbras/omniconnector` |
+
+The kernel version (`kernel.Version`) and the client SDK version (`package.json`, `VERSION` in `src/client.ts`) are kept in step for now.
+
 ## Running locally
 
 ```bash
@@ -65,6 +73,7 @@ make test-race      # all modules, race detector (PostgreSQL tests skip)
 make test-pg        # PostgreSQL store tests in a throwaway container
 make run-dev        # API on :8080, in-memory stores, test integration, admin dev token
 make docker-up      # API + PostgreSQL via docker compose (same token)
+make sdk-test       # client SDK unit + end-to-end tests against the built API
 curl -H "Authorization: Bearer dev-token-change-me-0123456789abcdef" \
      -H "Content-Type: application/json" \
      -d '{"integration":"test-integration","operationId":"echo","input":{"message":"hi"}}' \

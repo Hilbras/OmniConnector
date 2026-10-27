@@ -11,6 +11,14 @@ OmniConnector provides a centralized integration layer that handles connections,
 - [`docs/PLAN.md`](docs/PLAN.md) — the product, architecture, and phased development plan (the project's governing goal)
 - [`docs/STATUS.md`](docs/STATUS.md) — what is done, what is next, and interim decisions
 
+## Client SDK
+
+```bash
+npm install @hilbras/omniconnector
+```
+
+TypeScript client for the Kernel API — see [`packages/client-sdk`](packages/client-sdk/README.md).
+
 ## Monorepo Structure
 
 ```
@@ -31,7 +39,7 @@ OmniConnector/
 Prerequisites:
 - Go 1.22+
 - Docker
-- Node.js 20+ (for frontend packages)
+- Node.js 22.12+ (client SDK development; the published package runs on 20.3+)
 
 ```bash
 make build         # Build the kernel API

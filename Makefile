@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-race test-pg lint format format-check run-dev clean docker-up docker-down
+.PHONY: sdk-test sdk-build build test test-all test-race test-pg lint format format-check run-dev clean docker-up docker-down
 
 export PATH := /home/gin/go/bin:$(PATH)
 export GOPATH := /home/gin/go/path
@@ -29,6 +29,15 @@ test-pg:
 	@until docker exec omniconnector-test-pg pg_isready -U postgres -d omni_test >/dev/null 2>&1; do sleep 1; done; sleep 1
 	@cd packages/kernel-runtime && KERNEL_TEST_DATABASE_DSN="postgres://postgres:test@127.0.0.1:55439/omni_test?sslmode=disable" \
 		go test -race -count=1 ./pgstore/... ; status=$$?; docker rm -f omniconnector-test-pg >/dev/null; exit $$status
+
+## Client SDK: unit and end-to-end tests against the freshly built API
+sdk-test: build
+	cd packages/client-sdk && npm ci --no-audit --no-fund && npm run typecheck && \
+		OMNICONNECTOR_API_BIN=$(CURDIR)/build/kernel-api npm test
+
+## Client SDK: compile to packages/client-sdk/dist
+sdk-build:
+	cd packages/client-sdk && npm run build
 
 ## Vet every module
 lint:

@@ -42,3 +42,42 @@ jobs:
         run: go build -C services/kernel-api -o ../../build/kernel-api ./cmd/kernel-api
       - name: Build container image
         run: docker build -f deployment/Dockerfile.kernel-api .
+
+  client-sdk:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['22', '24']
+    defaults:
+      run:
+        working-directory: packages/client-sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: packages/client-sdk/package-lock.json
+      - name: Build kernel API for end-to-end tests
+        working-directory: .
+        run: go build -C services/kernel-api -o ../../build/kernel-api ./cmd/kernel-api
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Test (unit + end-to-end)
+        run: npm test
+        env:
+          OMNICONNECTOR_API_BIN: ${{ github.workspace }}/build/kernel-api
+      - run: npm run build
+      - run: npm pack
+      # The library supports older Node than its dev tooling; prove it on the floor
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.3.0'
+      - name: Smoke test on minimum Node
+        run: |
+          mkdir -p /tmp/smoke && cd /tmp/smoke && npm init -y >/dev/null
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE"/packages/client-sdk/hilbras-omniconnector-*.tgz
+          cp "$GITHUB_WORKSPACE"/packages/client-sdk/test/smoke.mjs . && node smoke.mjs
